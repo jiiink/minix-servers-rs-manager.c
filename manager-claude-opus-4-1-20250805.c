@@ -171,216 +171,256 @@ size_t dst_len;
 /*===========================================================================*
  *			      init_state_data				     *
  *===========================================================================*/
-#include <errno.h>
-#include <limits.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int get_endpoint_from_label(const char *label, endpoint_t *ep)
-{
-    if (ds_retrieve_label_endpt(label, ep) == OK) {
-        return OK;
-    }
-
-    if (strcmp("ANY_USR", label) == 0) {
-        *ep = ANY_USR;
-    } else if (strcmp("ANY_SYS", label) == 0) {
-        *ep = ANY_SYS;
-    } else if (strcmp("ANY_TSK", label) == 0) {
-        *ep = ANY_TSK;
-    } else {
-        char *end_ptr;
-        errno = 0;
-        long val = strtol(label, &end_ptr, 10);
-        if (errno != 0 || *end_ptr != '\0' || val > INT_MAX || val < INT_MIN) {
-            return ESRCH;
-        }
-        *ep = (endpoint_t)val;
-    }
-    return OK;
-}
-
-static int parse_ipc_filter_element(const struct rs_ipc_filter_el *src_el,
-                                    ipc_filter_el_t *dst_el)
-{
-    dst_el->flags = src_el->flags;
-    dst_el->m_type = 0;
-    dst_el->m_source = 0;
-
-    if (src_el->flags & IPCF_MATCH_M_TYPE) {
-        dst_el->m_type = src_el->m_type;
-    }
-
-    if (src_el->flags & IPCF_MATCH_M_SOURCE) {
-        int result = get_endpoint_from_label(src_el->m_label, &dst_el->m_source);
-        if (result != OK) {
-            return result;
-        }
-    }
-    return OK;
-}
-
-static int init_eval_expression(endpoint_t src_e,
-                                const struct rs_state_data *src_data,
-                                struct rs_state_data *dst_data)
-{
-    if (src_data->eval_len == 0 || src_data->eval_addr == NULL) {
-        return EINVAL;
-    }
-
-    dst_data->eval_addr = malloc(src_data->eval_len + 1);
-    if (dst_data->eval_addr == NULL) {
-        return ENOMEM;
-    }
-    dst_data->eval_len = src_data->eval_len;
-
-    int s = sys_datacopy(src_e, (vir_bytes)src_data->eval_addr,
-                         SELF, (vir_bytes)dst_data->eval_addr,
-                         dst_data->eval_len);
-    if (s != OK) {
-        free(dst_data->eval_addr);
-        dst_data->eval_addr = NULL;
-        return s;
-    }
-
-    ((char *)dst_data->eval_addr)[dst_data->eval_len] = '\0';
-    return OK;
-}
-
-static int init_ipc_filters(endpoint_t src_e,
-                            const struct rs_state_data *src_data,
-                            struct rs_state_data *dst_data)
-{
-    const size_t filter_group_size = sizeof(struct rs_ipc_filter_el[IPCF_MAX_ELEMENTS]);
-
-    if (src_data->ipcf_els_size % filter_group_size != 0) {
-        return E2BIG;
-    }
-
-    if (src_data->ipcf_els == NULL) {
-        return OK;
-    }
-
-    int num_ipc_filters = src_data->ipcf_els_size / filter_group_size;
-    int add_vm_filter = (src_e == VM_PROC_NR);
-    size_t num_total_filters = num_ipc_filters + add_vm_filter;
-
-    size_t ipcf_els_buff_size = sizeof(ipc_filter_el_t[IPCF_MAX_ELEMENTS]) * num_total_filters;
-    ipc_filter_el_t (*ipcf_els_buff)[IPCF_MAX_ELEMENTS] = calloc(1, ipcf_els_buff_size);
-    if (ipcf_els_buff == NULL) {
-        return ENOMEM;
-    }
-
-    struct rs_ipc_filter_el (*src_filters)[IPCF_MAX_ELEMENTS] = src_data->ipcf_els;
-    struct rs_ipc_filter_el local_filter_copy[IPCF_MAX_ELEMENTS];
-    int s = OK;
-
-    for (int i = 0; i < num_ipc_filters; i++) {
-        s = sys_datacopy(src_e, (vir_bytes)src_filters[i],
-                         SELF, (vir_bytes)local_filter_copy, filter_group_size);
-        if (s != OK) {
-            goto cleanup;
-        }
-
-        for (int j = 0; j < IPCF_MAX_ELEMENTS && local_filter_copy[j].flags; j++) {
-            s = parse_ipc_filter_element(&local_filter_copy[j], &ipcf_els_buff[i][j]);
-            if (s != OK) {
-                goto cleanup;
-            }
-        }
-    }
-
-    if (add_vm_filter) {
-        ipcf_els_buff[num_ipc_filters][0].flags = (IPCF_EL_WHITELIST | IPCF_MATCH_M_SOURCE | IPCF_MATCH_M_TYPE);
-        ipcf_els_buff[num_ipc_filters][0].m_source = RS_PROC_NR;
-        ipcf_els_buff[num_ipc_filters][0].m_type = VM_RS_UPDATE;
-    }
-
-    dst_data->ipcf_els = ipcf_els_buff;
-    dst_data->ipcf_els_size = ipcf_els_buff_size;
-    return OK;
-
-cleanup:
-    free(ipcf_els_buff);
-    return s;
-}
-
 int init_state_data(endpoint_t src_e, int prepare_state,
     struct rs_state_data *src_rs_state_data,
     struct rs_state_data *dst_rs_state_data)
 {
-    memset(dst_rs_state_data, 0, sizeof(*dst_rs_state_data));
+  if (!src_rs_state_data || !dst_rs_state_data) {
+      return EINVAL;
+  }
 
-    if (src_rs_state_data->size != sizeof(struct rs_state_data)) {
-        return E2BIG;
-    }
+  dst_rs_state_data->size = 0;
+  dst_rs_state_data->eval_addr = NULL;
+  dst_rs_state_data->eval_len = 0;
+  dst_rs_state_data->ipcf_els = NULL;
+  dst_rs_state_data->ipcf_els_size = 0;
 
-    int result = OK;
+  if (src_rs_state_data->size != sizeof(struct rs_state_data)) {
+      return E2BIG;
+  }
 
-    if (prepare_state == SEF_LU_STATE_EVAL) {
-        result = init_eval_expression(src_e, src_rs_state_data, dst_rs_state_data);
-        if (result != OK) {
-            return result;
-        }
-    }
+  if (prepare_state == SEF_LU_STATE_EVAL) {
+      int result = copy_eval_expression(src_e, src_rs_state_data, dst_rs_state_data);
+      if (result != OK) {
+          return result;
+      }
+  }
 
-    result = init_ipc_filters(src_e, src_rs_state_data, dst_rs_state_data);
-    if (result != OK) {
-        free(dst_rs_state_data->eval_addr);
-        dst_rs_state_data->eval_addr = NULL;
-        return result;
-    }
+  return copy_ipc_filters(src_e, src_rs_state_data, dst_rs_state_data);
+}
 
-    dst_rs_state_data->size = src_rs_state_data->size;
+static int copy_eval_expression(endpoint_t src_e,
+    struct rs_state_data *src_rs_state_data,
+    struct rs_state_data *dst_rs_state_data)
+{
+  if (src_rs_state_data->eval_len == 0 || !src_rs_state_data->eval_addr) {
+      return EINVAL;
+  }
 
-    return OK;
+  dst_rs_state_data->eval_addr = malloc(src_rs_state_data->eval_len + 1);
+  if (!dst_rs_state_data->eval_addr) {
+      return ENOMEM;
+  }
+
+  dst_rs_state_data->eval_len = src_rs_state_data->eval_len;
+  
+  int s = sys_datacopy(src_e, (vir_bytes)src_rs_state_data->eval_addr,
+      SELF, (vir_bytes)dst_rs_state_data->eval_addr,
+      dst_rs_state_data->eval_len);
+  if (s != OK) {
+      free(dst_rs_state_data->eval_addr);
+      dst_rs_state_data->eval_addr = NULL;
+      dst_rs_state_data->eval_len = 0;
+      return s;
+  }
+
+  ((char*)dst_rs_state_data->eval_addr)[dst_rs_state_data->eval_len] = '\0';
+  dst_rs_state_data->size = src_rs_state_data->size;
+  
+  return OK;
+}
+
+static int copy_ipc_filters(endpoint_t src_e,
+    struct rs_state_data *src_rs_state_data,
+    struct rs_state_data *dst_rs_state_data)
+{
+  size_t rs_ipc_filter_size = sizeof(struct rs_ipc_filter_el[IPCF_MAX_ELEMENTS]);
+
+  if (src_rs_state_data->ipcf_els_size % rs_ipc_filter_size) {
+      return E2BIG;
+  }
+
+  if (!src_rs_state_data->ipcf_els) {
+      dst_rs_state_data->size = src_rs_state_data->size;
+      return OK;
+  }
+
+  int num_ipc_filters = src_rs_state_data->ipcf_els_size / rs_ipc_filter_size;
+  size_t ipcf_els_buff_size = calculate_buffer_size(src_e, num_ipc_filters);
+  
+  ipc_filter_el_t (*ipcf_els_buff)[IPCF_MAX_ELEMENTS] = malloc(ipcf_els_buff_size);
+  if (!ipcf_els_buff) {
+      return ENOMEM;
+  }
+  memset(ipcf_els_buff, 0, ipcf_els_buff_size);
+
+  int result = process_ipc_filters(src_e, src_rs_state_data->ipcf_els,
+      num_ipc_filters, ipcf_els_buff);
+  if (result != OK) {
+      free(ipcf_els_buff);
+      return result;
+  }
+
+  if (src_e == VM_PROC_NR) {
+      add_vm_filter(ipcf_els_buff, num_ipc_filters);
+  }
+
+  dst_rs_state_data->size = src_rs_state_data->size;
+  dst_rs_state_data->ipcf_els = ipcf_els_buff;
+  dst_rs_state_data->ipcf_els_size = ipcf_els_buff_size;
+
+  return OK;
+}
+
+static size_t calculate_buffer_size(endpoint_t src_e, int num_ipc_filters)
+{
+  size_t base_size = sizeof(ipc_filter_el_t) * IPCF_MAX_ELEMENTS * num_ipc_filters;
+  if (src_e == VM_PROC_NR) {
+      base_size += sizeof(ipc_filter_el_t) * IPCF_MAX_ELEMENTS;
+  }
+  return base_size;
+}
+
+static int process_ipc_filters(endpoint_t src_e,
+    struct rs_ipc_filter_el (*rs_ipc_filter_els)[IPCF_MAX_ELEMENTS],
+    int num_ipc_filters,
+    ipc_filter_el_t (*ipcf_els_buff)[IPCF_MAX_ELEMENTS])
+{
+  struct rs_ipc_filter_el rs_ipc_filter[IPCF_MAX_ELEMENTS];
+  size_t rs_ipc_filter_size = sizeof(rs_ipc_filter);
+
+  for (int i = 0; i < num_ipc_filters; i++) {
+      int s = sys_datacopy(src_e, (vir_bytes)rs_ipc_filter_els[i],
+          SELF, (vir_bytes)rs_ipc_filter, rs_ipc_filter_size);
+      if (s != OK) {
+          return s;
+      }
+
+      int result = process_single_filter(rs_ipc_filter, ipcf_els_buff[i]);
+      if (result != OK) {
+          return result;
+      }
+  }
+  return OK;
+}
+
+static int process_single_filter(struct rs_ipc_filter_el *rs_ipc_filter,
+    ipc_filter_el_t *ipcf_els)
+{
+  for (int j = 0; j < IPCF_MAX_ELEMENTS && rs_ipc_filter[j].flags; j++) {
+      endpoint_t m_source = 0;
+      int m_type = 0;
+      int flags = rs_ipc_filter[j].flags;
+
+      if (flags & IPCF_MATCH_M_TYPE) {
+          m_type = rs_ipc_filter[j].m_type;
+      }
+
+      if (flags & IPCF_MATCH_M_SOURCE) {
+          int result = resolve_endpoint(&rs_ipc_filter[j], &m_source);
+          if (result != OK) {
+              return result;
+          }
+      }
+
+      ipcf_els[j].flags = flags;
+      ipcf_els[j].m_source = m_source;
+      ipcf_els[j].m_type = m_type;
+  }
+  return OK;
+}
+
+static int resolve_endpoint(struct rs_ipc_filter_el *filter_el, endpoint_t *m_source)
+{
+  if (ds_retrieve_label_endpt(filter_el->m_label, m_source) == OK) {
+      return OK;
+  }
+
+  if (!strcmp("ANY_USR", filter_el->m_label)) {
+      *m_source = ANY_USR;
+      return OK;
+  }
+  if (!strcmp("ANY_SYS", filter_el->m_label)) {
+      *m_source = ANY_SYS;
+      return OK;
+  }
+  if (!strcmp("ANY_TSK", filter_el->m_label)) {
+      *m_source = ANY_TSK;
+      return OK;
+  }
+
+  char *endptr;
+  errno = 0;
+  *m_source = strtol(filter_el->m_label, &endptr, 10);
+  if (errno || *endptr != '\0') {
+      return ESRCH;
+  }
+
+  return OK;
+}
+
+static void add_vm_filter(ipc_filter_el_t (*ipcf_els_buff)[IPCF_MAX_ELEMENTS],
+    int num_ipc_filters)
+{
+  ipcf_els_buff[num_ipc_filters][0].flags = 
+      IPCF_EL_WHITELIST | IPCF_MATCH_M_SOURCE | IPCF_MATCH_M_TYPE;
+  ipcf_els_buff[num_ipc_filters][0].m_source = RS_PROC_NR;
+  ipcf_els_buff[num_ipc_filters][0].m_type = VM_RS_UPDATE;
 }
 
 /*===========================================================================*
  *			        build_cmd_dep				     *
  *===========================================================================*/
-#include <stdio.h>
-#include <string.h>
-#include <stddef.h>
-
 void build_cmd_dep(struct rproc *rp)
 {
-    size_t r_args_size = sizeof(rp->r_args);
-    strncpy(rp->r_args, rp->r_cmd, r_args_size);
-    if (r_args_size > 0) {
-        rp->r_args[r_args_size - 1] = '\0';
+    struct rprocpub *rpub;
+    int arg_count;
+    char *cmd_ptr;
+    char *next_arg;
+
+    if (rp == NULL) {
+        return;
     }
 
-    rp->r_argc = 0;
-    char *p = rp->r_args;
+    rpub = rp->r_pub;
 
-    while (*p != '\0') {
-        while (*p == ' ') {
-            p++;
-        }
-        if (*p == '\0') {
-            break;
-        }
-
-        if (rp->r_argc >= ARGV_ELEMENTS - 1) {
-            fprintf(stderr, "RS: build_cmd_dep: Too many arguments.\n");
-            break;
-        }
-        rp->r_argv[rp->r_argc++] = p;
-
-        while (*p != ' ' && *p != '\0') {
-            p++;
-        }
-        
-        if (*p == '\0') {
-            break;
-        }
-
-        *p = '\0';
-        p++;
+    if (strlen(rp->r_cmd) >= sizeof(rp->r_args)) {
+        return;
     }
 
-    rp->r_argv[rp->r_argc] = NULL;
+    strcpy(rp->r_args, rp->r_cmd);
+    arg_count = 0;
+    rp->r_argv[arg_count++] = rp->r_args;
+    cmd_ptr = rp->r_args;
+
+    while (*cmd_ptr != '\0') {
+        if (*cmd_ptr != ' ') {
+            cmd_ptr++;
+            continue;
+        }
+
+        *cmd_ptr = '\0';
+        next_arg = cmd_ptr + 1;
+
+        while (*next_arg == ' ') {
+            next_arg++;
+        }
+
+        if (*next_arg == '\0') {
+            break;
+        }
+
+        if (arg_count >= ARGV_ELEMENTS - 1) {
+            printf("RS: build_cmd_dep: too many args\n");
+            break;
+        }
+
+        rp->r_argv[arg_count++] = next_arg;
+        cmd_ptr = next_arg;
+    }
+
+    rp->r_argv[arg_count] = NULL;
+    rp->r_argc = arg_count;
 }
 
 /*===========================================================================*
@@ -388,26 +428,33 @@ void build_cmd_dep(struct rproc *rp)
  *===========================================================================*/
 void end_srv_init(struct rproc *rp)
 {
+    struct rprocpub *rpub;
+    struct rproc *prev_rp;
+
     if (!rp) {
         return;
     }
 
+    rpub = rp->r_pub;
+    
     late_reply(rp, OK);
 
-    if (rp->r_prev_rp) {
-        struct rproc *prev_rp = rp->r_prev_rp;
+    prev_rp = rp->r_prev_rp;
+    if (!prev_rp) {
+        rp->r_next_rp = NULL;
+        return;
+    }
 
-        if (SRV_IS_UPD_SCHEDULED(prev_rp)) {
-            rupdate_upd_move(prev_rp, rp);
-        }
+    if (SRV_IS_UPD_SCHEDULED(prev_rp)) {
+        rupdate_upd_move(prev_rp, rp);
+    }
+    
+    cleanup_service(prev_rp);
+    rp->r_prev_rp = NULL;
+    rp->r_restarts++;
 
-        cleanup_service(prev_rp);
-        rp->r_prev_rp = NULL;
-        rp->r_restarts++;
-
-        if (rs_verbose) {
-            printf("RS: %s completed restart\n", srv_to_string(rp));
-        }
+    if (rs_verbose) {
+        printf("RS: %s completed restart\n", srv_to_string(rp));
     }
 
     rp->r_next_rp = NULL;
@@ -416,61 +463,74 @@ void end_srv_init(struct rproc *rp)
 /*===========================================================================*
  *			     kill_service_debug				     *
  *===========================================================================*/
-int kill_service_debug(const char *file, int line, struct rproc *rp, const char *errstr, int err)
+int kill_service_debug(char *file, int line, struct rproc *rp, char *errstr, int err)
 {
-    if (!rp) {
-        return err;
+    if (rp == NULL) {
+        return -1;
     }
-
-    if (errstr && !shutting_down) {
+    
+    if (errstr != NULL && !shutting_down) {
         printf("RS: %s (error %d)\n", errstr, err);
     }
-
+    
     rp->r_flags |= RS_EXITING;
     crash_service_debug(file, line, rp);
-
+    
     return err;
 }
 
 /*===========================================================================*
  *			    crash_service_debug				     *
  *===========================================================================*/
-#include <stdlib.h>
-#include <stdio.h>
-#include <signal.h>
-
-int crash_service_debug(const char *file, int line, const struct rproc *rp)
+int crash_service_debug(char *file, int line, struct rproc *rp)
 {
-    const struct rprocpub *rpub = rp->r_pub;
-
+    struct rprocpub *rpub;
+    
+    if (rp == NULL) {
+        return -1;
+    }
+    
+    rpub = rp->r_pub;
+    if (rpub == NULL) {
+        return -1;
+    }
+    
     if (rs_verbose) {
-        const char *adverb = (rp->r_flags & RS_EXITING) ? "lethally " : "";
-        printf("RS: %s %skilled at %s:%d\n", srv_to_string(rp), adverb, file, line);
+        const char *service_name = srv_to_string(rp);
+        const char *crash_type = (rp->r_flags & RS_EXITING) ? "lethally " : "";
+        printf("RS: %s %skilled at %s:%d\n", service_name, crash_type, file, line);
     }
-
+    
     if (rpub->endpoint == RS_PROC_NR) {
-        exit(EXIT_FAILURE);
+        exit(1);
     }
-
+    
     return sys_kill(rpub->endpoint, SIGKILL);
 }
 
 /*===========================================================================*
  *			  cleanup_service_debug				     *
  *===========================================================================*/
-void cleanup_service_debug(const char *file, int line, struct rproc *rp)
+void cleanup_service_debug(char *file, int line, struct rproc *rp)
 {
+    struct rprocpub *rpub;
+    int detach;
+    int cleanup_script;
+    int s;
+
     if (!rp) {
         return;
     }
 
-    struct rprocpub *rpub = rp->r_pub;
-    int s;
+    rpub = rp->r_pub;
+    if (!rpub) {
+        return;
+    }
 
     if (!(rp->r_flags & RS_DEAD)) {
         if (rs_verbose) {
-            printf("RS: %s marked for cleanup at %s:%d\n", srv_to_string(rp),
-                file, line);
+            printf("RS: %s marked for cleanup at %s:%d\n", 
+                   srv_to_string(rp), file, line);
         }
 
         if (rp->r_next_rp) {
@@ -489,6 +549,7 @@ void cleanup_service_debug(const char *file, int line, struct rproc *rp)
             rp->r_old_rp->r_new_rp = NULL;
             rp->r_old_rp = NULL;
         }
+
         rp->r_flags |= RS_DEAD;
 
         sys_privctl(rpub->endpoint, SYS_PRIV_DISALLOW, NULL);
@@ -496,61 +557,73 @@ void cleanup_service_debug(const char *file, int line, struct rproc *rp)
         rp->r_flags &= ~RS_ACTIVE;
 
         late_reply(rp, OK);
-
         return;
     }
 
-    if (!(rp->r_flags & RS_CLEANUP_DETACH)) {
+    cleanup_script = (rp->r_flags & RS_CLEANUP_SCRIPT) != 0;
+    detach = (rp->r_flags & RS_CLEANUP_DETACH) != 0;
+
+    if (!detach) {
         if (rs_verbose) {
-            printf("RS: %s cleaned up at %s:%d\n", srv_to_string(rp),
-                file, line);
+            printf("RS: %s cleaned up at %s:%d\n", 
+                   srv_to_string(rp), file, line);
         }
 
-        if ((s = sched_stop(rp->r_scheduler, rpub->endpoint)) != OK) {
+        s = sched_stop(rp->r_scheduler, rpub->endpoint);
+        if (s != OK) {
             printf("RS: warning: scheduler won't give up process: %d\n", s);
         }
 
-        if (rp->r_pid == -1) {
-            printf("RS: warning: attempt to kill pid -1!\n");
-        } else {
+        if (rp->r_pid > 0) {
             srv_kill(rp->r_pid, SIGKILL);
+        } else {
+            printf("RS: warning: attempt to kill invalid pid: %d\n", rp->r_pid);
         }
     }
 
-    if (rp->r_flags & RS_CLEANUP_SCRIPT) {
+    if (cleanup_script) {
         rp->r_flags &= ~RS_CLEANUP_SCRIPT;
-        if ((s = run_script(rp)) != OK) {
+        s = run_script(rp);
+        if (s != OK) {
             printf("RS: warning: cannot run cleanup script: %d\n", s);
         }
     }
 
-    if (rp->r_flags & RS_CLEANUP_DETACH) {
+    if (detach) {
         detach_service(rp);
-    } else {
-        if (!(rp->r_flags & RS_REINCARNATE)) {
-            free_slot(rp);
-        }
+    } else if (!(rp->r_flags & RS_REINCARNATE)) {
+        free_slot(rp);
     }
 }
 
 /*===========================================================================*
  *			     detach_service_debug			     *
  *===========================================================================*/
-void detach_service_debug(const char *file, int line, struct rproc *rp)
+void detach_service_debug(char *file, int line, struct rproc *rp)
 {
     static unsigned long detach_counter = 0;
-    char old_label[RS_MAX_LABEL_LEN];
+    char label[RS_MAX_LABEL_LEN];
     struct rprocpub *rpub;
+    int result;
 
-    if (!rp || !rp->r_pub) {
+    if (rp == NULL) {
         return;
     }
+
     rpub = rp->r_pub;
+    if (rpub == NULL) {
+        return;
+    }
 
-    strncpy(old_label, rpub->label, RS_MAX_LABEL_LEN - 1);
-    old_label[RS_MAX_LABEL_LEN - 1] = '\0';
+    if (strlcpy(label, rpub->label, sizeof(label)) >= sizeof(label)) {
+        return;
+    }
 
-    snprintf(rpub->label, RS_MAX_LABEL_LEN, "%lu.%s", ++detach_counter, old_label);
+    result = snprintf(rpub->label, RS_MAX_LABEL_LEN, "%lu.%s", ++detach_counter, label);
+    if (result < 0 || result >= RS_MAX_LABEL_LEN) {
+        return;
+    }
+
     ds_publish_label(rpub->label, rpub->endpoint, DSF_OVERWRITE);
 
     if (rs_verbose) {
@@ -568,93 +641,123 @@ void detach_service_debug(const char *file, int line, struct rproc *rp)
 /*===========================================================================*
  *				create_service				     *
  *===========================================================================*/
-static int pin_root_service_memory(const struct rproc *rp)
-{
-    int s;
-
-    if (rs_verbose) {
-        printf("RS: pinning memory of RS instance %s\n", srv_to_string(rp));
-    }
-
-    s = vm_memctl(rp->r_pub->endpoint, VM_RS_MEM_PIN, 0, 0);
-    if (s != OK) {
-        printf("RS: vm_memctl failed to pin root service: %d\n", s);
-    }
-    return s;
-}
-
-static int setup_vm_service(const struct rproc *rp)
-{
-    struct rproc *rs_rp;
-    struct rproc **rs_rps;
-    int i, nr_rs_rps, s;
-
-    if (rs_verbose) {
-        printf("RS: informing VM of instance %s\n", srv_to_string(rp));
-    }
-
-    s = vm_memctl(rp->r_pub->endpoint, VM_RS_MEM_MAKE_VM, 0, 0);
-    if (s != OK) {
-        printf("RS: vm_memctl failed to make VM instance: %d\n", s);
-        return s;
-    }
-
-    rs_rp = rproc_ptr[_ENDPOINT_P(RS_PROC_NR)];
-    get_service_instances(rs_rp, &rs_rps, &nr_rs_rps);
-    for (i = 0; i < nr_rs_rps; i++) {
-        vm_memctl(rs_rps[i]->r_pub->endpoint, VM_RS_MEM_PIN, 0, 0);
-    }
-
-    return OK;
-}
-
 int create_service(struct rproc *rp)
 {
-    int s;
-    int child_proc_nr_e, child_proc_nr_n;
-    pid_t child_pid;
-    int use_copy;
-    int has_replica;
-    int needs_free_exec = 0;
     struct rprocpub *rpub;
+    pid_t child_pid;
+    int child_proc_nr_e, child_proc_nr_n;
+    int s;
+    int use_copy, has_replica;
     extern char **environ;
 
-    rpub = rp->r_pub;
-    use_copy = !!(rpub->sys_flags & SF_USE_COPY);
-    has_replica = !!(rp->r_old_rp || (rp->r_prev_rp && !(rp->r_prev_rp->r_flags & RS_TERMINATED)));
-
-    if (!has_replica && (rpub->sys_flags & SF_NEED_REPL)) {
-        printf("RS: unable to create service '%s' without a replica\n", rpub->label);
-        s = EPERM;
-    } else if (!use_copy && (rpub->sys_flags & SF_NEED_COPY)) {
-        printf("RS: unable to create service '%s' without an in-memory copy\n", rpub->label);
-        s = EPERM;
-    } else if (!use_copy && strcmp(rp->r_cmd, "") == 0) {
-        printf("RS: unable to create service '%s' without a copy or command\n", rpub->label);
-        s = EPERM;
-    } else {
-        s = OK;
+    if (rp == NULL) {
+        return EINVAL;
     }
+
+    rpub = rp->r_pub;
+    if (rpub == NULL) {
+        return EINVAL;
+    }
+
+    use_copy = (rpub->sys_flags & SF_USE_COPY) != 0;
+    has_replica = (rp->r_old_rp != NULL) || 
+                  (rp->r_prev_rp != NULL && !(rp->r_prev_rp->r_flags & RS_TERMINATED));
+
+    s = validate_service_requirements(rp, rpub, use_copy, has_replica);
     if (s != OK) {
-        free_slot(rp);
         return s;
     }
 
-    if (rs_verbose) printf("RS: forking child with srv_fork()...\n");
-    child_pid = srv_fork(rp->r_uid, 0);
+    child_pid = fork_service_process(rp);
     if (child_pid < 0) {
         printf("RS: srv_fork() failed (error %d)\n", child_pid);
         free_slot(rp);
         return child_pid;
     }
 
-    if ((s = getprocnr(child_pid, &child_proc_nr_e)) != OK) {
-        printf("RS: unable to get child endpoint for pid %d (error %d)\n", child_pid, s);
-        free_slot(rp);
-        return s;
+    s = getprocnr(child_pid, &child_proc_nr_e);
+    if (s != 0) {
+        panic("unable to get child endpoint: %d", s);
     }
 
     child_proc_nr_n = _ENDPOINT_P(child_proc_nr_e);
+    initialize_process_entry(rp, rpub, child_pid, child_proc_nr_e, child_proc_nr_n);
+
+    s = setup_process_privileges(rp, child_proc_nr_e);
+    if (s != OK) {
+        return s;
+    }
+
+    s = sched_init_proc(rp);
+    if (s != OK) {
+        printf("RS: unable to start scheduling: %d\n", s);
+        cleanup_service(rp);
+        vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
+        return s;
+    }
+
+    s = execute_service(rp, rpub, child_proc_nr_e, use_copy, environ);
+    if (s != OK) {
+        return s;
+    }
+
+    setuid(0);
+
+    s = handle_special_processes(rp, rpub);
+    if (s != OK) {
+        return s;
+    }
+
+    s = vm_set_priv(rpub->endpoint, &rpub->vm_call_mask[0], TRUE);
+    if (s != OK) {
+        printf("RS: vm_set_priv failed: %d\n", s);
+        cleanup_service(rp);
+        return s;
+    }
+
+    if (rs_verbose) {
+        printf("RS: %s created\n", srv_to_string(rp));
+    }
+
+    return OK;
+}
+
+static int validate_service_requirements(struct rproc *rp, struct rprocpub *rpub, 
+                                         int use_copy, int has_replica)
+{
+    if (!has_replica && (rpub->sys_flags & SF_NEED_REPL)) {
+        printf("RS: unable to create service '%s' without a replica\n", rpub->label);
+        free_slot(rp);
+        return EPERM;
+    }
+
+    if (!use_copy && (rpub->sys_flags & SF_NEED_COPY)) {
+        printf("RS: unable to create service '%s' without an in-memory copy\n", rpub->label);
+        free_slot(rp);
+        return EPERM;
+    }
+
+    if (!use_copy && strlen(rp->r_cmd) == 0) {
+        printf("RS: unable to create service '%s' without a copy or command\n", rpub->label);
+        free_slot(rp);
+        return EPERM;
+    }
+
+    return OK;
+}
+
+static pid_t fork_service_process(struct rproc *rp)
+{
+    if (rs_verbose) {
+        printf("RS: forking child with srv_fork()...\n");
+    }
+    return srv_fork(rp->r_uid, 0);
+}
+
+static void initialize_process_entry(struct rproc *rp, struct rprocpub *rpub,
+                                     pid_t child_pid, int child_proc_nr_e, 
+                                     int child_proc_nr_n)
+{
     rp->r_flags = RS_IN_USE;
     rpub->endpoint = child_proc_nr_e;
     rp->r_pid = child_pid;
@@ -664,64 +767,138 @@ int create_service(struct rproc *rp)
     rp->r_backoff = 0;
     rproc_ptr[child_proc_nr_n] = rp;
     rpub->in_use = TRUE;
+}
 
-    if ((s = sys_privctl(child_proc_nr_e, SYS_PRIV_SET_SYS, &rp->r_priv)) != OK ||
-        (s = sys_getpriv(&rp->r_priv, child_proc_nr_e)) != OK) {
+static int setup_process_privileges(struct rproc *rp, int child_proc_nr_e)
+{
+    int s;
+
+    s = sys_privctl(child_proc_nr_e, SYS_PRIV_SET_SYS, &rp->r_priv);
+    if (s != OK) {
         printf("RS: unable to set privilege structure: %d\n", s);
-        s = ENOMEM;
-        goto cleanup_repin;
+        cleanup_service(rp);
+        vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
+        return ENOMEM;
     }
 
-    if ((s = sched_init_proc(rp)) != OK) {
-        printf("RS: unable to start scheduling: %d\n", s);
-        goto cleanup_repin;
+    s = sys_getpriv(&rp->r_priv, child_proc_nr_e);
+    if (s != OK) {
+        printf("RS: unable to get privilege structure: %d\n", s);
+        cleanup_service(rp);
+        vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
+        return ENOMEM;
     }
 
-    if (!use_copy) {
-        if ((s = read_exec(rp)) != OK) {
-            printf("RS: read_exec failed: %d\n", s);
-            goto cleanup_repin;
+    return OK;
+}
+
+static int execute_service(struct rproc *rp, struct rprocpub *rpub, 
+                           int child_proc_nr_e, int use_copy, char **environ)
+{
+    int s;
+
+    if (use_copy) {
+        if (rs_verbose) {
+            printf("RS: %s uses an in-memory copy\n", srv_to_string(rp));
         }
-        needs_free_exec = 1;
+    } else {
+        s = read_exec(rp);
+        if (s != OK) {
+            printf("RS: read_exec failed: %d\n", s);
+            cleanup_service(rp);
+            vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
+            return s;
+        }
     }
 
-    if (rs_verbose) printf("RS: execing child with srv_execve()...\n");
-    s = srv_execve(child_proc_nr_e, rp->r_exec, rp->r_exec_len, rpub->proc_name, rp->r_argv, environ);
+    if (rs_verbose) {
+        printf("RS: execing child with srv_execve()...\n");
+    }
+
+    s = srv_execve(child_proc_nr_e, rp->r_exec, rp->r_exec_len, 
+                   rpub->proc_name, rp->r_argv, environ);
     vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
-
-    if (needs_free_exec) {
-        free_exec(rp);
-    }
 
     if (s != OK) {
         printf("RS: srv_execve failed: %d\n", s);
-        goto cleanup;
+        cleanup_service(rp);
+        return s;
     }
 
-    setuid(0);
-
-    if ((rp->r_priv.s_flags & ROOT_SYS_PROC) && (s = pin_root_service_memory(rp)) != OK) {
-        goto cleanup;
+    if (!use_copy) {
+        free_exec(rp);
     }
-
-    if ((rp->r_priv.s_flags & VM_SYS_PROC) && (s = setup_vm_service(rp)) != OK) {
-        goto cleanup;
-    }
-
-    if ((s = vm_set_priv(rpub->endpoint, &rpub->vm_call_mask[0], TRUE)) != OK) {
-        printf("RS: vm_set_priv failed: %d\n", s);
-        goto cleanup;
-    }
-
-    if (rs_verbose) printf("RS: %s created\n", srv_to_string(rp));
 
     return OK;
+}
 
-cleanup_repin:
-    vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
-cleanup:
-    cleanup_service(rp);
-    return s;
+static int handle_special_processes(struct rproc *rp, struct rprocpub *rpub)
+{
+    int s;
+
+    if (rp->r_priv.s_flags & ROOT_SYS_PROC) {
+        s = handle_rs_instance(rp, rpub);
+        if (s != OK) {
+            return s;
+        }
+    }
+
+    if (rp->r_priv.s_flags & VM_SYS_PROC) {
+        s = handle_vm_instance(rp, rpub);
+        if (s != OK) {
+            return s;
+        }
+    }
+
+    return OK;
+}
+
+static int handle_rs_instance(struct rproc *rp, struct rprocpub *rpub)
+{
+    int s;
+
+    if (rs_verbose) {
+        printf("RS: pinning memory of RS instance %s\n", srv_to_string(rp));
+    }
+
+    s = vm_memctl(rpub->endpoint, VM_RS_MEM_PIN, 0, 0);
+    if (s != OK) {
+        printf("vm_memctl failed: %d\n", s);
+        cleanup_service(rp);
+        return s;
+    }
+
+    return OK;
+}
+
+static int handle_vm_instance(struct rproc *rp, struct rprocpub *rpub)
+{
+    struct rproc *rs_rp;
+    struct rproc **rs_rps;
+    int i, nr_rs_rps;
+    int s;
+
+    if (rs_verbose) {
+        printf("RS: informing VM of instance %s\n", srv_to_string(rp));
+    }
+
+    s = vm_memctl(rpub->endpoint, VM_RS_MEM_MAKE_VM, 0, 0);
+    if (s != OK) {
+        printf("vm_memctl failed: %d\n", s);
+        cleanup_service(rp);
+        return s;
+    }
+
+    rs_rp = rproc_ptr[_ENDPOINT_P(RS_PROC_NR)];
+    get_service_instances(rs_rp, &rs_rps, &nr_rs_rps);
+    
+    for (i = 0; i < nr_rs_rps; i++) {
+        if (rs_rps[i] != NULL && rs_rps[i]->r_pub != NULL) {
+            vm_memctl(rs_rps[i]->r_pub->endpoint, VM_RS_MEM_PIN, 0, 0);
+        }
+    }
+
+    return OK;
 }
 
 /*===========================================================================*
@@ -729,15 +906,25 @@ cleanup:
  *===========================================================================*/
 int clone_service(struct rproc *rp, int instance_flag, int init_flags)
 {
-    struct rproc *replica_rp;
+    struct rproc *replica_rp = NULL;
+    struct rprocpub *replica_rpub;
+    struct rproc **rp_link;
+    struct rproc **replica_link;
+    struct rproc *rs_rp;
+    int rs_flags;
     int r;
-    const int is_live_update = (instance_flag == LU_SYS_PROC);
+
+    if (rp == NULL) {
+        return EINVAL;
+    }
 
     if (rs_verbose) {
         printf("RS: %s creating a replica\n", srv_to_string(rp));
     }
 
-    if (is_live_update && rp->r_pub->endpoint == VM_PROC_NR && rp->r_next_rp) {
+    if (rp->r_pub->endpoint == VM_PROC_NR && 
+        instance_flag == LU_SYS_PROC && 
+        rp->r_next_rp != NULL) {
         cleanup_service_now(rp->r_next_rp);
         rp->r_next_rp = NULL;
     }
@@ -747,45 +934,45 @@ int clone_service(struct rproc *rp, int instance_flag, int init_flags)
         return r;
     }
 
+    replica_rpub = replica_rp->r_pub;
+
+    if (instance_flag == LU_SYS_PROC) {
+        rp_link = &rp->r_new_rp;
+        replica_link = &replica_rp->r_old_rp;
+    } else {
+        rp_link = &rp->r_next_rp;
+        replica_link = &replica_rp->r_prev_rp;
+    }
+
     replica_rp->r_priv.s_flags |= instance_flag;
     replica_rp->r_priv.s_init_flags |= init_flags;
 
-    if (is_live_update) {
-        rp->r_new_rp = replica_rp;
-        replica_rp->r_old_rp = rp;
-    } else {
-        rp->r_next_rp = replica_rp;
-        replica_rp->r_prev_rp = rp;
-    }
+    *rp_link = replica_rp;
+    *replica_link = rp;
 
     r = create_service(replica_rp);
     if (r != OK) {
-        if (is_live_update) {
-            rp->r_new_rp = NULL;
-        } else {
-            rp->r_next_rp = NULL;
-        }
+        *rp_link = NULL;
         return r;
     }
 
-    const int rs_flags = ROOT_SYS_PROC | RST_SYS_PROC;
-    if ((replica_rp->r_priv.s_flags & rs_flags) == rs_flags) {
-        struct rproc *rs_rp = rproc_ptr[_ENDPOINT_P(RS_PROC_NR)];
-        struct rprocpub *replica_rpub = replica_rp->r_pub;
+    rs_flags = ROOT_SYS_PROC | RST_SYS_PROC;
+    if ((replica_rp->r_priv.s_flags & rs_flags) != rs_flags) {
+        return OK;
+    }
 
-        r = update_sig_mgrs(rs_rp, SELF, replica_rpub->endpoint);
-        if (r == OK) {
-            r = update_sig_mgrs(replica_rp, SELF, NONE);
-        }
+    rs_rp = rproc_ptr[_ENDPOINT_P(RS_PROC_NR)];
+    
+    r = update_sig_mgrs(rs_rp, SELF, replica_rpub->endpoint);
+    if (r != OK) {
+        *rp_link = NULL;
+        return kill_service(replica_rp, "update_sig_mgrs failed", r);
+    }
 
-        if (r != OK) {
-            if (is_live_update) {
-                rp->r_new_rp = NULL;
-            } else {
-                rp->r_next_rp = NULL;
-            }
-            return kill_service(replica_rp, "update_sig_mgrs failed", r);
-        }
+    r = update_sig_mgrs(replica_rp, SELF, NONE);
+    if (r != OK) {
+        *rp_link = NULL;
+        return kill_service(replica_rp, "update_sig_mgrs failed", r);
     }
 
     return OK;
@@ -794,30 +981,19 @@ int clone_service(struct rproc *rp, int instance_flag, int init_flags)
 /*===========================================================================*
  *				publish_service				     *
  *===========================================================================*/
-#include <string.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <minix/rs.h>
-#include <minix/ipc.h>
-#include <minix/ds.h>
-#include "rs.h"
-
-/* Forward declarations for static functions not shown in the original snippet */
-static int kill_service(struct rproc *rp, const char *reason, int err);
-static const char* srv_to_string(struct rproc *rp);
-
-#if USE_PCI
-#include <minix/pci.h>
-#endif
-
 int publish_service(struct rproc *rp)
 {
-    if (!rp || !rp->r_pub) {
+    int r;
+    struct rprocpub *rpub;
+    struct rs_pci pci_acl;
+    message m;
+    endpoint_t ep;
+
+    if (rp == NULL || rp->r_pub == NULL) {
         return EINVAL;
     }
 
-    struct rprocpub *rpub = rp->r_pub;
-    int r;
+    rpub = rp->r_pub;
 
     r = ds_publish_label(rpub->label, rpub->endpoint, DSF_OVERWRITE);
     if (r != OK) {
@@ -825,19 +1001,7 @@ int publish_service(struct rproc *rp)
     }
 
     if (rpub->dev_nr > 0 || rpub->nr_domain > 0) {
-        /* The purpose of non-blocking forks is to avoid involving VFS in the
-         * forking process, because VFS may be blocked on a ipc_sendrec() to a MFS
-         * that is waiting for a endpoint update for a dead driver. We have just
-         * published that update, but VFS may still be blocked. As a result, VFS
-         * may not yet have received PM's fork message. Hence, if we call
-         * mapdriver() immediately, VFS may not know about the process and thus
-         * refuse to add the driver entry. The following temporary hack works
-         * around this by forcing blocking communication from PM to VFS. Once VFS
-         * has been made non-blocking towards MFS instances, this hack and the
-         * big part of srv_fork() can go.
-         */
         setuid(0);
-
         r = mapdriver(rpub->label, rpub->dev_nr, rpub->domain, rpub->nr_domain);
         if (r != OK) {
             return kill_service(rp, "couldn't map driver", r);
@@ -846,37 +1010,30 @@ int publish_service(struct rproc *rp)
 
 #if USE_PCI
     if (rpub->pci_acl.rsp_nr_device || rpub->pci_acl.rsp_nr_class) {
-        struct rs_pci pci_acl = rpub->pci_acl;
+        pci_acl = rpub->pci_acl;
+        strcpy(pci_acl.rsp_label, rpub->label);
         pci_acl.rsp_endpoint = rpub->endpoint;
-
-        strncpy(pci_acl.rsp_label, rpub->label, sizeof(pci_acl.rsp_label) - 1);
-        pci_acl.rsp_label[sizeof(pci_acl.rsp_label) - 1] = '\0';
 
         r = pci_set_acl(&pci_acl);
         if (r != OK) {
             return kill_service(rp, "pci_set_acl call failed", r);
         }
     }
-#endif /* USE_PCI */
+#endif
 
     if (rpub->devman_id != 0) {
-        endpoint_t ep;
         r = ds_retrieve_label_endpt("devman", &ep);
         if (r != OK) {
             return kill_service(rp, "devman not running?", r);
         }
 
-        message m;
         m.m_type = DEVMAN_BIND;
         m.DEVMAN_ENDPOINT = rpub->endpoint;
         m.DEVMAN_DEVICE_ID = rpub->devman_id;
         
         r = ipc_sendrec(ep, &m);
-        if (r != OK) {
-            return kill_service(rp, "devman bind ipc failed", r);
-        }
-        if (m.DEVMAN_RESULT != OK) {
-            return kill_service(rp, "devman bind request failed", m.DEVMAN_RESULT);
+        if (r != OK || m.DEVMAN_RESULT != OK) {
+            return kill_service(rp, "devman bind device failed", r);
         }
     }
 
@@ -892,84 +1049,54 @@ int publish_service(struct rproc *rp)
  *===========================================================================*/
 int unpublish_service(struct rproc *rp)
 {
-/* Unpublish a service. */
     struct rprocpub *rpub;
-    int status;
-    int result;
+    int result = OK;
+    int r;
 
-    if (!rp || !rp->r_pub) {
+    if (rp == NULL || rp->r_pub == NULL) {
         return EINVAL;
     }
 
     rpub = rp->r_pub;
-    result = OK;
 
-    /* Unregister label with DS. */
-    status = ds_delete_label(rpub->label);
-    if (status != OK) {
-        if (!shutting_down) {
-            printf("RS: ds_delete_label for '%s' failed (error %d)\n",
-                rpub->label, status);
-        }
-        result = status;
+    r = ds_delete_label(rpub->label);
+    if (r != OK && !shutting_down) {
+        printf("RS: ds_delete_label call failed (error %d)\n", r);
+        result = r;
     }
-
-    /* No need to inform VFS and VM, cleanup is done on exit automatically. */
 
 #if USE_PCI
-    /* If PCI properties are set, inform the PCI driver. */
     if (rpub->pci_acl.rsp_nr_device || rpub->pci_acl.rsp_nr_class) {
-        status = pci_del_acl(rpub->endpoint);
-        if (status != OK) {
-            if (!shutting_down) {
-                printf("RS: pci_del_acl for endpoint %d failed (error %d)\n",
-                    rpub->endpoint, status);
-            }
-            if (result == OK) {
-                result = status;
-            }
+        r = pci_del_acl(rpub->endpoint);
+        if (r != OK && !shutting_down) {
+            printf("RS: pci_del_acl call failed (error %d)\n", r);
+            result = r;
         }
     }
-#endif /* USE_PCI */
+#endif
 
     if (rpub->devman_id != 0) {
         endpoint_t ep;
-        status = ds_retrieve_label_endpt("devman", &ep);
-        if (status != OK) {
-            if (!shutting_down) {
-                printf("RS: failed to retrieve devman endpoint (error %d)\n", status);
-            }
-            if (result == OK) {
-                result = status;
-            }
+        r = ds_retrieve_label_endpt("devman", &ep);
+        
+        if (r != OK) {
+            printf("RS: devman not running?");
         } else {
             message m;
             m.m_type = DEVMAN_UNBIND;
-            m.DEVMAN_ENDPOINT  = rpub->endpoint;
+            m.DEVMAN_ENDPOINT = rpub->endpoint;
             m.DEVMAN_DEVICE_ID = rpub->devman_id;
-            status = ipc_sendrec(ep, &m);
+            r = ipc_sendrec(ep, &m);
 
-            if (status != OK) {
-                if (!shutting_down) {
-                    printf("RS: ipc_sendrec to devman failed (error %d)\n", status);
-                }
-                if (result == OK) {
-                    result = status;
-                }
-            } else if (m.DEVMAN_RESULT != OK) {
-                if (!shutting_down) {
-                    printf("RS: devman unbind for device %d failed (error %d)\n",
-                        rpub->devman_id, m.DEVMAN_RESULT);
-                }
-                if (result == OK) {
-                    result = m.DEVMAN_RESULT;
-                }
+            if (r != OK || m.DEVMAN_RESULT != OK) {
+                printf("RS: devman unbind device failed");
             }
         }
     }
 
-    if(rs_verbose)
+    if (rs_verbose) {
         printf("RS: %s unpublished\n", srv_to_string(rp));
+    }
 
     return result;
 }
@@ -979,20 +1106,26 @@ int unpublish_service(struct rproc *rp)
  *===========================================================================*/
 int run_service(struct rproc *rp, int init_type, int init_flags)
 {
-    int status;
+    struct rprocpub *rpub;
+    int s;
 
-    if (!rp || !rp->r_pub) {
-        return -1;
+    if (rp == NULL) {
+        return EINVAL;
     }
 
-    status = sys_privctl(rp->r_pub->endpoint, SYS_PRIV_ALLOW, NULL);
-    if (status != OK) {
-        return kill_service(rp, "Failed to set service privileges", status);
+    rpub = rp->r_pub;
+    if (rpub == NULL) {
+        return EINVAL;
     }
 
-    status = init_service(rp, init_type, init_flags);
-    if (status != OK) {
-        return kill_service(rp, "Failed to initialize service", status);
+    s = sys_privctl(rpub->endpoint, SYS_PRIV_ALLOW, NULL);
+    if (s != OK) {
+        return kill_service(rp, "unable to allow the service to run", s);
+    }
+
+    s = init_service(rp, init_type, init_flags);
+    if (s != OK) {
+        return kill_service(rp, "unable to initialize service", s);
     }
 
     if (rs_verbose) {
@@ -1007,19 +1140,25 @@ int run_service(struct rproc *rp, int init_type, int init_flags)
  *===========================================================================*/
 int start_service(struct rproc *rp, int init_flags)
 {
-    if (!rp || !rp->r_pub) {
+    int r;
+    struct rprocpub *rpub;
+
+    if (rp == NULL) {
         return EINVAL;
     }
 
-    int r;
+    rpub = rp->r_pub;
+    if (rpub == NULL) {
+        return EINVAL;
+    }
 
     rp->r_priv.s_init_flags |= init_flags;
-
+    
     r = create_service(rp);
     if (r != OK) {
         return r;
     }
-
+    
     activate_service(rp, NULL);
 
     r = publish_service(rp);
@@ -1028,12 +1167,15 @@ int start_service(struct rproc *rp, int init_flags)
     }
 
     r = run_service(rp, SEF_INIT_FRESH, init_flags);
-    if (r == OK && rs_verbose) {
-        printf("RS: %s started with major %d\n", srv_to_string(rp),
-               rp->r_pub->dev_nr);
+    if (r != OK) {
+        return r;
     }
 
-    return r;
+    if (rs_verbose) {
+        printf("RS: %s started with major %d\n", srv_to_string(rp), rpub->dev_nr);
+    }
+
+    return OK;
 }
 
 /*===========================================================================*
@@ -1041,22 +1183,27 @@ int start_service(struct rproc *rp, int init_flags)
  *===========================================================================*/
 void stop_service(struct rproc *rp, int how)
 {
-    const struct rprocpub *rpub = rp->r_pub;
-    const int signo = (rpub->endpoint == RS_PROC_NR) ? SIGHUP : SIGTERM;
+    struct rprocpub *rpub;
+    int signo;
+
+    if (rp == NULL) {
+        return;
+    }
+
+    rpub = rp->r_pub;
+    if (rpub == NULL) {
+        return;
+    }
 
     if (rs_verbose) {
-        printf("RS: Signaling %s to stop with signal %d\n",
-               srv_to_string(rp), signo);
+        printf("RS: %s signaled with SIGTERM\n", srv_to_string(rp));
     }
+
+    signo = (rpub->endpoint != RS_PROC_NR) ? SIGTERM : SIGHUP;
 
     rp->r_flags |= how;
-
-    if (sys_kill(rpub->endpoint, signo) == 0) {
-        rp->r_stop_tm = getticks();
-    } else {
-        printf("RS: ERROR: Failed to send signal to endpoint %d\n",
-               rpub->endpoint);
-    }
+    sys_kill(rpub->endpoint, signo);
+    rp->r_stop_tm = getticks();
 }
 
 /*===========================================================================*
@@ -1064,17 +1211,18 @@ void stop_service(struct rproc *rp, int how)
  *===========================================================================*/
 void activate_service(struct rproc *rp, struct rproc *ex_rp)
 {
-    const int should_deactivate = ex_rp && (ex_rp->r_flags & RS_ACTIVE);
-    const int should_activate = rp && !(rp->r_flags & RS_ACTIVE);
+    if (rp == NULL) {
+        return;
+    }
 
-    if (should_deactivate) {
+    if (ex_rp != NULL && (ex_rp->r_flags & RS_ACTIVE) != 0) {
         ex_rp->r_flags &= ~RS_ACTIVE;
         if (rs_verbose) {
             printf("RS: %s becomes inactive\n", srv_to_string(ex_rp));
         }
     }
 
-    if (should_activate) {
+    if ((rp->r_flags & RS_ACTIVE) == 0) {
         rp->r_flags |= RS_ACTIVE;
         if (rs_verbose) {
             printf("RS: %s becomes active\n", srv_to_string(rp));
@@ -1087,22 +1235,32 @@ void activate_service(struct rproc *rp, struct rproc *ex_rp)
  *===========================================================================*/
 void reincarnate_service(struct rproc *old_rp)
 {
+    struct rproc *rp;
+    int r;
+    int restarts;
+
     if (old_rp == NULL) {
-        printf("RS: Error: reincarnate_service called with a NULL service pointer.\n");
         return;
     }
 
-    struct rproc *rp;
-    int r = clone_slot(old_rp, &rp);
+    r = clone_slot(old_rp, &rp);
     if (r != OK) {
         printf("RS: Failed to clone the slot: %d\n", r);
         return;
     }
 
-    rp->r_flags = RS_IN_USE;
-    rproc_ptr[_ENDPOINT_P(rp->r_pub->endpoint)] = NULL;
+    if (rp == NULL || rp->r_pub == NULL) {
+        return;
+    }
 
-    const int restarts = rp->r_restarts;
+    rp->r_flags = RS_IN_USE;
+    
+    int endpoint_index = _ENDPOINT_P(rp->r_pub->endpoint);
+    if (endpoint_index >= 0 && endpoint_index < NR_PROCS) {
+        rproc_ptr[endpoint_index] = NULL;
+    }
+
+    restarts = rp->r_restarts;
     start_service(rp, SEF_INIT_FRESH);
     rp->r_restarts = restarts + 1;
 }
@@ -1110,52 +1268,87 @@ void reincarnate_service(struct rproc *old_rp)
 /*===========================================================================*
  *			      terminate_service				     *
  *===========================================================================*/
-static int handle_initialization_failure(struct rproc *rp)
+void terminate_service(struct rproc *rp)
 {
-    if (!(rp->r_flags & RS_INITIALIZING)) {
-        return 0;
+    struct rproc **rps;
+    struct rprocpub *rpub;
+    int nr_rps, norestart;
+    int i, r;
+
+    if (!rp || !rp->r_pub) {
+        return;
     }
 
+    rpub = rp->r_pub;
+
+    if (rs_verbose) {
+        printf("RS: %s terminated\n", srv_to_string(rp));
+    }
+
+    if (rp->r_flags & RS_INITIALIZING) {
+        handle_initialization_failure(rp, rpub);
+    }
+
+    if (RUPDATE_IS_UPDATING()) {
+        printf("RS: aborting the update after a crash...\n");
+        abort_update_proc(ERESTART);
+    }
+
+    norestart = determine_norestart(rp);
+    
+    if (rp->r_flags & RS_EXITING) {
+        handle_exiting_service(rp, norestart);
+    }
+    else if (rp->r_flags & RS_REFRESHING) {
+        restart_service(rp);
+    }
+    else {
+        handle_restart_backoff(rp, rpub);
+    }
+}
+
+static void handle_initialization_failure(struct rproc *rp, struct rprocpub *rpub)
+{
     if (SRV_IS_UPDATING(rp)) {
         printf("RS: update failed: state transfer failed. Rolling back...\n");
         end_update(rp->r_init_err, RS_REPLY);
         rp->r_init_err = ERESTART;
-        return 1;
+        return;
     }
 
-    if (rp->r_pub->sys_flags & SF_NO_BIN_EXP) {
+    if (rpub->sys_flags & SF_NO_BIN_EXP) {
         if (rs_verbose) {
-            printf("RS: service '%s' exited during initialization; "
-                   "refreshing\n", rp->r_pub->label);
+            printf("RS: service '%s' exited during initialization; refreshing\n", rpub->label);
         }
         rp->r_flags |= RS_REFRESHING;
     } else {
         if (rs_verbose) {
-            printf("RS: service '%s' exited during initialization; "
-                   "exiting\n", rp->r_pub->label);
+            printf("RS: service '%s' exited during initialization; exiting\n", rpub->label);
         }
         rp->r_flags |= RS_EXITING;
     }
-    return 0;
 }
 
-static int force_exit_if_no_restart(struct rproc *rp)
+static int determine_norestart(struct rproc *rp)
 {
     int norestart = !(rp->r_flags & RS_EXITING) && (rp->r_pub->sys_flags & SF_NORESTART);
+    
     if (norestart) {
         rp->r_flags |= RS_EXITING;
-        if ((rp->r_pub->sys_flags & SF_DET_RESTART)
-            && (rp->r_restarts < MAX_DET_RESTART)) {
+        
+        if ((rp->r_pub->sys_flags & SF_DET_RESTART) && (rp->r_restarts < MAX_DET_RESTART)) {
             rp->r_flags |= RS_CLEANUP_DETACH;
         }
+        
         if (rp->r_script[0] != '\0') {
             rp->r_flags |= RS_CLEANUP_SCRIPT;
         }
     }
+    
     return norestart;
 }
 
-static void cleanup_and_exit_service(struct rproc *rp, int norestart)
+static void handle_exiting_service(struct rproc *rp, int norestart)
 {
     struct rproc **rps;
     int nr_rps;
@@ -1171,8 +1364,8 @@ static void cleanup_and_exit_service(struct rproc *rp, int norestart)
         abort_update_proc(EDEADSRCDST);
     }
 
-    r = (rp->r_caller_request == RS_DOWN
-        || (rp->r_caller_request == RS_REFRESH && norestart)) ? OK : EDEADEPT;
+    r = (rp->r_caller_request == RS_DOWN || 
+         (rp->r_caller_request == RS_REFRESH && norestart)) ? OK : EDEADEPT;
     late_reply(rp, r);
 
     unpublish_service(rp);
@@ -1188,142 +1381,105 @@ static void cleanup_and_exit_service(struct rproc *rp, int norestart)
     }
 }
 
-static int should_restart_immediately(struct rproc *rp)
+static void handle_restart_backoff(struct rproc *rp, struct rprocpub *rpub)
 {
-    struct rprocpub *rpub = rp->r_pub;
-
-    if (rp->r_restarts == 0) {
-        return 1;
+    if (rp->r_restarts > 0) {
+        calculate_backoff(rp, rpub);
+        return;
     }
 
+    restart_service(rp);
+}
+
+static void calculate_backoff(struct rproc *rp, struct rprocpub *rpub)
+{
     if (!(rpub->sys_flags & SF_NO_BIN_EXP)) {
-        rp->r_backoff = 1 << MIN(rp->r_restarts, (BACKOFF_BITS - 2));
+        int shift_amount = MIN(rp->r_restarts, (BACKOFF_BITS - 2));
+        rp->r_backoff = 1 << shift_amount;
         rp->r_backoff = MIN(rp->r_backoff, MAX_BACKOFF);
+        
         if ((rpub->sys_flags & SF_USE_COPY) && rp->r_backoff > 1) {
             rp->r_backoff = 1;
         }
     } else {
         rp->r_backoff = 1;
     }
-
-    return 0;
-}
-
-void terminate_service(struct rproc *rp)
-{
-    int norestart;
-
-    if (rs_verbose) {
-        printf("RS: %s terminated\n", srv_to_string(rp));
-    }
-
-    if (handle_initialization_failure(rp)) {
-        return;
-    }
-
-    if (RUPDATE_IS_UPDATING()) {
-        printf("RS: aborting the update after a crash...\n");
-        abort_update_proc(ERESTART);
-    }
-
-    norestart = force_exit_if_no_restart(rp);
-
-    if (rp->r_flags & RS_EXITING) {
-        cleanup_and_exit_service(rp, norestart);
-    } else if (rp->r_flags & RS_REFRESHING) {
-        restart_service(rp);
-    } else {
-        if (should_restart_immediately(rp)) {
-            restart_service(rp);
-        }
-    }
 }
 
 /*===========================================================================*
  *				run_script				     *
  *===========================================================================*/
-static const char *get_reason_string(unsigned int flags)
+static int run_script(struct rproc *rp)
 {
-	if (flags & RS_REFRESHING) {
-		return "restart";
-	}
-	if (flags & RS_NOPINGREPLY) {
-		return "no-heartbeat";
-	}
-	return "terminated";
-}
+	int r, endpoint;
+	pid_t pid;
+	char *reason;
+	char incarnation_str[20];
+	char *envp[1] = { NULL };
+	struct rprocpub *rpub;
 
-static void log_script_execution(const struct rproc *rp, const char *reason,
-	const char *incarnation_str)
-{
+	if (rp == NULL || rp->r_pub == NULL) {
+		return EINVAL;
+	}
+
+	rpub = rp->r_pub;
+	
+	if (rp->r_flags & RS_REFRESHING) {
+		reason = "restart";
+	} else if (rp->r_flags & RS_NOPINGREPLY) {
+		reason = "no-heartbeat";
+	} else {
+		reason = "terminated";
+	}
+	
+	r = snprintf(incarnation_str, sizeof(incarnation_str), "%d", rp->r_restarts);
+	if (r < 0 || r >= sizeof(incarnation_str)) {
+		return EINVAL;
+	}
+
 	if (rs_verbose) {
 		printf("RS: %s:\n", srv_to_string(rp));
 		printf("RS:     calling script '%s'\n", rp->r_script);
 		printf("RS:     reason: '%s'\n", reason);
 		printf("RS:     incarnation: '%s'\n", incarnation_str);
 	}
-}
-
-static void execute_script_in_child(struct rproc *rp, const char *reason,
-	const char *incarnation_str)
-{
-	char *envp[] = { NULL };
-	struct rprocpub *rpub = rp->r_pub;
-
-	execle(_PATH_BSHELL, "sh", rp->r_script, rpub->label, reason,
-		incarnation_str, (char *) NULL, envp);
-
-	printf("RS: run_script: execle '%s' failed: %s\n",
-		rp->r_script, strerror(errno));
-	exit(1);
-}
-
-static int setup_child_privileges(pid_t pid, struct rproc *rp)
-{
-	int r, endpoint;
-
-	if ((r = getprocnr(pid, &endpoint)) != OK) {
-		panic("unable to get child endpoint: %d", r);
-	}
-	if ((r = sys_privctl(endpoint, SYS_PRIV_SET_USER, NULL)) != OK) {
-		return kill_service(rp, "can't set script privileges", r);
-	}
-	if ((r = vm_set_priv(endpoint, NULL, FALSE)) != OK) {
-		return kill_service(rp, "can't set script VM privs", r);
-	}
-	if ((r = sys_privctl(endpoint, SYS_PRIV_ALLOW, NULL)) != OK) {
-		return kill_service(rp, "can't let the script run", r);
-	}
-
-	vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
-
-	return OK;
-}
-
-static int run_script(struct rproc *rp)
-{
-	pid_t pid;
-	char incarnation_str[20];
-	const char *reason = get_reason_string(rp->r_flags);
-
-	int len = snprintf(incarnation_str, sizeof(incarnation_str), "%d",
-		rp->r_restarts);
-	if (len < 0 || (size_t)len >= sizeof(incarnation_str)) {
-		return E2BIG;
-	}
-
-	log_script_execution(rp, reason, incarnation_str);
 
 	pid = fork();
-	if (pid < 0) {
+	if (pid == -1) {
 		return errno;
 	}
-
+	
 	if (pid == 0) {
-		execute_script_in_child(rp, reason, incarnation_str);
+		execle(_PATH_BSHELL, "sh", rp->r_script, rpub->label, reason,
+			incarnation_str, (char*) NULL, envp);
+		printf("RS: run_script: execl '%s' failed: %s\n",
+			rp->r_script, strerror(errno));
+		exit(1);
 	}
-
-	return setup_child_privileges(pid, rp);
+	
+	r = getprocnr(pid, &endpoint);
+	if (r != 0) {
+		panic("unable to get child endpoint: %d", r);
+	}
+	
+	r = sys_privctl(endpoint, SYS_PRIV_SET_USER, NULL);
+	if (r != OK) {
+		return kill_service(rp, "can't set script privileges", r);
+	}
+	
+	r = vm_set_priv(endpoint, NULL, FALSE);
+	if (r != OK) {
+		return kill_service(rp, "can't set script VM privs", r);
+	}
+	
+	r = sys_privctl(endpoint, SYS_PRIV_ALLOW, NULL);
+	if (r != OK) {
+		return kill_service(rp, "can't let the script run", r);
+	}
+	
+	vm_memctl(RS_PROC_NR, VM_RS_MEM_PIN, 0, 0);
+	
+	return OK;
 }
 
 /*===========================================================================*
@@ -1334,37 +1490,48 @@ void restart_service(struct rproc *rp)
     struct rproc *replica_rp;
     int r;
 
+    if (rp == NULL) {
+        return;
+    }
+
     late_reply(rp, OK);
 
     if (rp->r_script[0] != '\0') {
-        if (run_script(rp) != OK) {
+        r = run_script(rp);
+        if (r != OK) {
             kill_service(rp, "unable to run script", errno);
         }
         return;
     }
 
-    replica_rp = rp->r_next_rp;
-    if (replica_rp == NULL) {
+    if (rp->r_next_rp == NULL) {
         r = clone_service(rp, RST_SYS_PROC, 0);
         if (r != OK) {
             kill_service(rp, "unable to clone service", r);
             return;
         }
-        replica_rp = rp->r_next_rp;
+    }
+    
+    replica_rp = rp->r_next_rp;
+    if (replica_rp == NULL) {
+        kill_service(rp, "replica creation failed", EINVAL);
+        return;
     }
 
-    if ((r = update_service(&rp, &replica_rp, RS_SWAP, 0)) != OK) {
+    r = update_service(&rp, &replica_rp, RS_SWAP, 0);
+    if (r != OK) {
         kill_service(rp, "unable to update into new replica", r);
         return;
     }
 
-    if ((r = run_service(replica_rp, SEF_INIT_RESTART, 0)) != OK) {
+    r = run_service(replica_rp, SEF_INIT_RESTART, 0);
+    if (r != OK) {
         kill_service(rp, "unable to let the replica run", r);
         return;
     }
 
-    if ((rp->r_pub->sys_flags & SF_DET_RESTART)
-        && (rp->r_restarts < MAX_DET_RESTART)) {
+    if ((rp->r_pub->sys_flags & SF_DET_RESTART) != 0 &&
+        rp->r_restarts < MAX_DET_RESTART) {
         rp->r_flags |= RS_CLEANUP_DETACH;
     }
 
@@ -1379,63 +1546,67 @@ void restart_service(struct rproc *rp)
  *===========================================================================*/
 void inherit_service_defaults(struct rproc *def_rp, struct rproc *rp)
 {
-    if (!def_rp || !rp || !def_rp->r_pub || !rp->r_pub) {
-        return;
-    }
+  struct rprocpub *def_rpub;
+  struct rprocpub *rpub;
+  int i;
 
-    struct rprocpub *def_rpub = def_rp->r_pub;
-    struct rprocpub *rpub = rp->r_pub;
+  if (def_rp == NULL || rp == NULL) {
+    return;
+  }
 
-    rpub->dev_nr = def_rpub->dev_nr;
-    rpub->nr_domain = def_rpub->nr_domain;
-    if (def_rpub->nr_domain > 0) {
-        memcpy(rpub->domain, def_rpub->domain,
-               (size_t)def_rpub->nr_domain * sizeof(rpub->domain[0]));
-    }
-    rpub->pci_acl = def_rpub->pci_acl;
+  def_rpub = def_rp->r_pub;
+  rpub = rp->r_pub;
 
-    rpub->sys_flags &= ~IMM_SF;
-    rpub->sys_flags |= (def_rpub->sys_flags & IMM_SF);
+  if (def_rpub == NULL || rpub == NULL) {
+    return;
+  }
 
-    rp->r_priv.s_flags &= ~IMM_F;
-    rp->r_priv.s_flags |= (def_rp->r_priv.s_flags & IMM_F);
+  rpub->dev_nr = def_rpub->dev_nr;
+  rpub->nr_domain = def_rpub->nr_domain;
+  
+  for (i = 0; i < def_rpub->nr_domain; i++) {
+    rpub->domain[i] = def_rpub->domain[i];
+  }
+  
+  rpub->pci_acl = def_rpub->pci_acl;
 
-    rp->r_priv.s_trap_mask = def_rp->r_priv.s_trap_mask;
+  rpub->sys_flags &= ~IMM_SF;
+  rpub->sys_flags |= (def_rpub->sys_flags & IMM_SF);
+  rp->r_priv.s_flags &= ~IMM_F;
+  rp->r_priv.s_flags |= (def_rp->r_priv.s_flags & IMM_F);
+
+  rp->r_priv.s_trap_mask = def_rp->r_priv.s_trap_mask;
 }
 
 /*===========================================================================*
  *		           get_service_instances			     *
  *===========================================================================*/
-void get_service_instances(const struct rproc *rp, struct rproc **rps, int *length)
+void get_service_instances(struct rproc *rp, struct rproc ***rps, int *length)
 {
     static struct rproc *instances[5];
     int nr_instances = 0;
-
+    
     if (rp == NULL || rps == NULL || length == NULL) {
-        if (rps != NULL) {
-            *rps = NULL;
-        }
-        if (length != NULL) {
-            *length = 0;
-        }
+        if (rps != NULL) *rps = NULL;
+        if (length != NULL) *length = 0;
         return;
     }
-
-    instances[nr_instances++] = (struct rproc *)rp;
-
-    if (rp->r_prev_rp != NULL) {
-        instances[nr_instances++] = rp->r_prev_rp;
+    
+    instances[nr_instances++] = rp;
+    
+    struct rproc *related[] = {
+        rp->r_prev_rp,
+        rp->r_next_rp,
+        rp->r_old_rp,
+        rp->r_new_rp
+    };
+    
+    for (int i = 0; i < 4 && nr_instances < 5; i++) {
+        if (related[i] != NULL) {
+            instances[nr_instances++] = related[i];
+        }
     }
-    if (rp->r_next_rp != NULL) {
-        instances[nr_instances++] = rp->r_next_rp;
-    }
-    if (rp->r_old_rp != NULL) {
-        instances[nr_instances++] = rp->r_old_rp;
-    }
-    if (rp->r_new_rp != NULL) {
-        instances[nr_instances++] = rp->r_new_rp;
-    }
-
+    
     *rps = instances;
     *length = nr_instances;
 }
@@ -1443,15 +1614,18 @@ void get_service_instances(const struct rproc *rp, struct rproc **rps, int *leng
 /*===========================================================================*
  *				share_exec				     *
  *===========================================================================*/
-void share_exec(struct rproc *rp_dst, const struct rproc *rp_src)
+void share_exec(struct rproc *rp_dst, struct rproc *rp_src)
 {
     if (rp_dst == NULL || rp_src == NULL) {
         return;
     }
 
     if (rs_verbose) {
-        printf("RS: %s shares exec image with %s\n",
-            srv_to_string(rp_dst), srv_to_string(rp_src));
+        const char *dst_str = srv_to_string(rp_dst);
+        const char *src_str = srv_to_string(rp_src);
+        if (dst_str != NULL && src_str != NULL) {
+            printf("RS: %s shares exec image with %s\n", dst_str, src_str);
+        }
     }
 
     rp_dst->r_exec_len = rp_src->r_exec_len;
@@ -1463,12 +1637,20 @@ void share_exec(struct rproc *rp_dst, const struct rproc *rp_src)
  *===========================================================================*/
 int read_exec(struct rproc *rp)
 {
-    const char *e_name = rp->r_argv[0];
+    int fd = -1;
+    ssize_t bytes_read;
+    int saved_errno;
+    char *e_name;
     struct stat sb;
-    int fd;
 
-    if (rs_verbose) {
-        printf("RS: service '%s' reads exec image from: %s\n",
+    if (rp == NULL || rp->r_argv == NULL || rp->r_argv[0] == NULL) {
+        return EINVAL;
+    }
+
+    e_name = rp->r_argv[0];
+    
+    if (rs_verbose && rp->r_pub != NULL && rp->r_pub->label != NULL) {
+        printf("RS: service '%s' reads exec image from: %s\n", 
                rp->r_pub->label, e_name);
     }
 
@@ -1476,44 +1658,39 @@ int read_exec(struct rproc *rp)
         return -errno;
     }
 
-    if (sb.st_size < 0 || (size_t)sb.st_size < sizeof(Elf_Ehdr)) {
+    if (sb.st_size < sizeof(Elf_Ehdr)) {
         return ENOEXEC;
     }
 
     fd = open(e_name, O_RDONLY);
-    if (fd < 0) {
+    if (fd == -1) {
         return -errno;
     }
 
-    size_t exec_len = (size_t)sb.st_size;
-    rp->r_exec = malloc(exec_len);
+    rp->r_exec_len = sb.st_size;
+    rp->r_exec = malloc(rp->r_exec_len);
     if (rp->r_exec == NULL) {
-        fprintf(stderr, "RS: read_exec: unable to allocate %zu bytes for %s\n",
-                exec_len, e_name);
+        printf("RS: read_exec: unable to allocate %zu bytes\n", rp->r_exec_len);
         close(fd);
         return ENOMEM;
     }
-    rp->r_exec_len = exec_len;
 
-    ssize_t bytes_read = read(fd, rp->r_exec, rp->r_exec_len);
-    int read_errno = errno;
+    bytes_read = read(fd, rp->r_exec, rp->r_exec_len);
+    saved_errno = errno;
     close(fd);
 
-    if (bytes_read == (ssize_t)rp->r_exec_len) {
+    if (bytes_read == rp->r_exec_len) {
         return OK;
     }
 
+    printf("RS: read_exec: read failed %zd, errno %d\n", bytes_read, saved_errno);
     free_exec(rp);
 
     if (bytes_read >= 0) {
-        fprintf(stderr, "RS: read_exec: short read on %s (%zd of %zu bytes)\n",
-                e_name, bytes_read, rp->r_exec_len);
         return EIO;
     }
-
-    fprintf(stderr, "RS: read_exec: read from %s failed: %s\n",
-            e_name, strerror(read_errno));
-    return -read_errno;
+    
+    return -saved_errno;
 }
 
 /*===========================================================================*
@@ -1521,30 +1698,34 @@ int read_exec(struct rproc *rp)
  *===========================================================================*/
 void free_exec(struct rproc *rp)
 {
-    if (!rp || !rp->r_exec) {
+    if (rp == NULL || rp->r_exec == NULL) {
         return;
     }
 
-    struct rproc *sharer = NULL;
+    int has_shared_exec = 0;
+    struct rproc *other_rp = NULL;
+
     for (int slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
-        struct rproc *other_rp = &rproc[slot_nr];
-        if ((other_rp->r_flags & RS_IN_USE) &&
-            (other_rp != rp) &&
-            (other_rp->r_exec == rp->r_exec)) {
-            sharer = other_rp;
+        struct rproc *current_rp = &rproc[slot_nr];
+        if ((current_rp->r_flags & RS_IN_USE) && 
+            current_rp != rp && 
+            current_rp->r_exec == rp->r_exec) {
+            has_shared_exec = 1;
+            other_rp = current_rp;
             break;
         }
     }
 
-    if (sharer) {
-        if (rs_verbose) {
-            printf("RS: %s no longer sharing exec image with %s\n",
-                   srv_to_string(rp), srv_to_string(sharer));
-        }
-    } else {
-        if (rs_verbose) {
+    if (rs_verbose) {
+        if (!has_shared_exec) {
             printf("RS: %s frees exec image\n", srv_to_string(rp));
+        } else {
+            printf("RS: %s no longer sharing exec image with %s\n",
+                srv_to_string(rp), srv_to_string(other_rp));
         }
+    }
+
+    if (!has_shared_exec) {
         free(rp->r_exec);
     }
 
@@ -1895,20 +2076,45 @@ endpoint_t source;
 /*===========================================================================*
  *				clone_slot				     *
  *===========================================================================*/
-static void initialize_clone(struct rproc *clone_rp, const struct rproc *src_rp)
+int clone_slot(struct rproc *rp, struct rproc **clone_rpp)
 {
-    struct rprocpub *clone_rpub = clone_rp->r_pub;
+    int r;
+    struct rproc *clone_rp;
+    struct rprocpub *rpub;
+    struct rprocpub *clone_rpub;
+
+    if (rp == NULL || clone_rpp == NULL) {
+        return EINVAL;
+    }
+
+    r = alloc_slot(&clone_rp);
+    if (r != OK) {
+        printf("RS: clone_slot: unable to allocate a new slot: %d\n", r);
+        return r;
+    }
+
+    rpub = rp->r_pub;
+    clone_rpub = clone_rp->r_pub;
+
+    r = sys_getpriv(&(rp->r_priv), rpub->endpoint);
+    if (r != OK) {
+        panic("unable to synch privilege structure: %d", r);
+    }
+
+    *clone_rp = *rp;
+    *clone_rpub = *rpub;
 
     clone_rp->r_init_err = ERESTART;
     clone_rp->r_flags &= ~RS_ACTIVE;
     clone_rp->r_pid = -1;
     clone_rpub->endpoint = -1;
-
+    clone_rp->r_pub = clone_rpub;
     build_cmd_dep(clone_rp);
+    
     if (clone_rpub->sys_flags & SF_USE_COPY) {
-        share_exec(clone_rp, src_rp);
+        share_exec(clone_rp, rp);
     }
-
+    
     clone_rp->r_old_rp = NULL;
     clone_rp->r_new_rp = NULL;
     clone_rp->r_prev_rp = NULL;
@@ -1917,31 +2123,6 @@ static void initialize_clone(struct rproc *clone_rp, const struct rproc *src_rp)
     clone_rp->r_priv.s_flags |= DYN_PRIV_ID;
     clone_rp->r_priv.s_flags &= ~(LU_SYS_PROC | RST_SYS_PROC);
     clone_rp->r_priv.s_init_flags = 0;
-}
-
-int clone_slot(struct rproc *rp, struct rproc **clone_rpp)
-{
-    int r;
-    struct rproc *clone_rp;
-    struct rprocpub *clone_rpub_ptr;
-
-    if ((r = alloc_slot(&clone_rp)) != OK) {
-        printf("RS: clone_slot: unable to allocate a new slot: %d\n", r);
-        return r;
-    }
-
-    if ((r = sys_getpriv(&rp->r_priv, rp->r_pub->endpoint)) != OK) {
-        panic("unable to synch privilege structure: %d", r);
-    }
-
-    clone_rpub_ptr = clone_rp->r_pub;
-
-    *clone_rp = *rp;
-    *clone_rpub_ptr = *(rp->r_pub);
-
-    clone_rp->r_pub = clone_rpub_ptr;
-
-    initialize_clone(clone_rp, rp);
 
     *clone_rpp = clone_rp;
     return OK;
@@ -1953,16 +2134,16 @@ int clone_slot(struct rproc *rp, struct rproc **clone_rpp)
 static void swap_slot_pointer(struct rproc **rpp, struct rproc *src_rp,
     struct rproc *dst_rp)
 {
-    if (!rpp) {
-        return;
-    }
-
-    struct rproc *current_rp = *rpp;
-    if (current_rp == src_rp) {
-        *rpp = dst_rp;
-    } else if (current_rp == dst_rp) {
-        *rpp = src_rp;
-    }
+  if (rpp == NULL) {
+      return;
+  }
+  
+  if (*rpp == src_rp) {
+      *rpp = dst_rp;
+  }
+  else if (*rpp == dst_rp) {
+      *rpp = src_rp;
+  }
 }
 
 /*===========================================================================*
@@ -1970,60 +2151,62 @@ static void swap_slot_pointer(struct rproc **rpp, struct rproc *src_rp,
  *===========================================================================*/
 void swap_slot(struct rproc **src_rpp, struct rproc **dst_rpp)
 {
-    if (!src_rpp || !(*src_rpp) || !dst_rpp || !(*dst_rpp)) {
+    if (src_rpp == NULL || dst_rpp == NULL) {
         return;
     }
-
+    
     struct rproc *src_rp = *src_rpp;
     struct rproc *dst_rp = *dst_rpp;
-
-    if (src_rp == dst_rp) {
+    
+    if (src_rp == NULL || dst_rp == NULL) {
         return;
     }
-
+    
     struct rprocpub *src_rpub = src_rp->r_pub;
     struct rprocpub *dst_rpub = dst_rp->r_pub;
-
-    if (!src_rpub || !dst_rpub) {
+    
+    if (src_rpub == NULL || dst_rpub == NULL) {
         return;
     }
-
-    struct rprocpub temp_rpub = *src_rpub;
-    *src_rpub = *dst_rpub;
-    *dst_rpub = temp_rpub;
-
-    struct rproc temp_rp = *src_rp;
-    *src_rp = *dst_rp;
-    *dst_rp = temp_rp;
-
-    struct rprocpub *pub_ptr_temp = src_rp->r_pub;
-    src_rp->r_pub = dst_rp->r_pub;
-    dst_rp->r_pub = pub_ptr_temp;
-
-    struct rprocupd *upd_ptr_temp = src_rp->r_upd;
-    src_rp->r_upd = dst_rp->r_upd;
-    dst_rp->r_upd = upd_ptr_temp;
-
+    
+    struct rproc orig_src_rproc = *src_rp;
+    struct rprocpub orig_src_rprocpub = *src_rpub;
+    struct rproc orig_dst_rproc = *dst_rp;
+    struct rprocpub orig_dst_rprocpub = *dst_rpub;
+    
+    *src_rp = orig_dst_rproc;
+    *src_rpub = orig_dst_rprocpub;
+    *dst_rp = orig_src_rproc;
+    *dst_rpub = orig_src_rprocpub;
+    
+    src_rp->r_pub = orig_src_rproc.r_pub;
+    dst_rp->r_pub = orig_dst_rproc.r_pub;
+    src_rp->r_upd = orig_src_rproc.r_upd;
+    dst_rp->r_upd = orig_dst_rproc.r_upd;
+    
     build_cmd_dep(src_rp);
     build_cmd_dep(dst_rp);
-
+    
     swap_slot_pointer(&src_rp->r_prev_rp, src_rp, dst_rp);
     swap_slot_pointer(&src_rp->r_next_rp, src_rp, dst_rp);
     swap_slot_pointer(&src_rp->r_old_rp, src_rp, dst_rp);
     swap_slot_pointer(&src_rp->r_new_rp, src_rp, dst_rp);
-
     swap_slot_pointer(&dst_rp->r_prev_rp, src_rp, dst_rp);
     swap_slot_pointer(&dst_rp->r_next_rp, src_rp, dst_rp);
     swap_slot_pointer(&dst_rp->r_old_rp, src_rp, dst_rp);
     swap_slot_pointer(&dst_rp->r_new_rp, src_rp, dst_rp);
-
-    struct rprocupd *prev_rpupd, *rpupd;
+    
+    struct rprocupd *prev_rpupd;
+    struct rprocupd *rpupd;
     RUPDATE_ITER(rupdate.first_rpupd, prev_rpupd, rpupd,
         swap_slot_pointer(&rpupd->rp, src_rp, dst_rp);
     );
-    swap_slot_pointer(&rproc_ptr[_ENDPOINT_P(src_rp->r_pub->endpoint)], src_rp, dst_rp);
-    swap_slot_pointer(&rproc_ptr[_ENDPOINT_P(dst_rp->r_pub->endpoint)], src_rp, dst_rp);
-
+    
+    swap_slot_pointer(&rproc_ptr[_ENDPOINT_P(src_rp->r_pub->endpoint)],
+        src_rp, dst_rp);
+    swap_slot_pointer(&rproc_ptr[_ENDPOINT_P(dst_rp->r_pub->endpoint)],
+        src_rp, dst_rp);
+    
     *src_rpp = dst_rp;
     *dst_rpp = src_rp;
 }
@@ -2031,16 +2214,25 @@ void swap_slot(struct rproc **src_rpp, struct rproc **dst_rpp)
 /*===========================================================================*
  *			   lookup_slot_by_label				     *
  *===========================================================================*/
-struct rproc* lookup_slot_by_label(const char *label)
+struct rproc* lookup_slot_by_label(char *label)
 {
-    if (!label) {
+    if (label == NULL) {
         return NULL;
     }
 
-    for (int i = 0; i < NR_SYS_PROCS; i++) {
-        struct rproc *rp = &rproc[i];
-        if ((rp->r_flags & RS_ACTIVE) && rp->r_pub &&
-            strcmp(rp->r_pub->label, label) == 0) {
+    for (int slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
+        struct rproc *rp = &rproc[slot_nr];
+        
+        if ((rp->r_flags & RS_ACTIVE) == 0) {
+            continue;
+        }
+        
+        struct rprocpub *rpub = rp->r_pub;
+        if (rpub == NULL || rpub->label == NULL) {
+            continue;
+        }
+        
+        if (strcmp(rpub->label, label) == 0) {
             return rp;
         }
     }
@@ -2059,7 +2251,7 @@ struct rproc* lookup_slot_by_pid(pid_t pid)
 
     for (int slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
         struct rproc *rp = &rproc[slot_nr];
-        if ((rp->r_flags & RS_IN_USE) && (rp->r_pid == pid)) {
+        if ((rp->r_flags & RS_IN_USE) && rp->r_pid == pid) {
             return rp;
         }
     }
@@ -2070,15 +2262,16 @@ struct rproc* lookup_slot_by_pid(pid_t pid)
 /*===========================================================================*
  *			   lookup_slot_by_dev_nr			     *
  *===========================================================================*/
-struct rproc *lookup_slot_by_dev_nr(dev_t dev_nr)
+struct rproc* lookup_slot_by_dev_nr(dev_t dev_nr)
 {
-    if (dev_nr <= 0) {
+    if (dev_nr == 0) {
         return NULL;
     }
 
     for (int slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
         struct rproc *rp = &rproc[slot_nr];
-        if ((rp->r_flags & RS_IN_USE) && rp->r_pub && (rp->r_pub->dev_nr == dev_nr)) {
+        
+        if ((rp->r_flags & RS_IN_USE) && rp->r_pub->dev_nr == dev_nr) {
             return rp;
         }
     }
@@ -2089,33 +2282,33 @@ struct rproc *lookup_slot_by_dev_nr(dev_t dev_nr)
 /*===========================================================================*
  *			   lookup_slot_by_domain			     *
  *===========================================================================*/
-static bool process_supports_domain(const struct rproc *rp, int domain)
-{
-    if (!rp || !rp->r_pub) {
-        return false;
-    }
-
-    const struct rprocpub *rpub = rp->r_pub;
-    for (int i = 0; i < rpub->nr_domain; i++) {
-        if (rpub->domain[i] == domain) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 struct rproc* lookup_slot_by_domain(int domain)
 {
-/* Lookup a service slot matching the given protocol family. */
+    struct rproc *rp;
+    struct rprocpub *rpub;
+    int slot_nr;
+    int i;
+
     if (domain <= 0) {
         return NULL;
     }
 
-    for (int slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
-        struct rproc *rp = &rproc[slot_nr];
-        if ((rp->r_flags & RS_IN_USE) && process_supports_domain(rp, domain)) {
-            return rp;
+    for (slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
+        rp = &rproc[slot_nr];
+        
+        if ((rp->r_flags & RS_IN_USE) == 0) {
+            continue;
+        }
+        
+        rpub = rp->r_pub;
+        if (rpub == NULL) {
+            continue;
+        }
+        
+        for (i = 0; i < rpub->nr_domain; i++) {
+            if (rpub->domain[i] == domain) {
+                return rp;
+            }
         }
     }
 
@@ -2125,16 +2318,19 @@ struct rproc* lookup_slot_by_domain(int domain)
 /*===========================================================================*
  *			   lookup_slot_by_flags				     *
  *===========================================================================*/
-struct rproc* lookup_slot_by_flags(const int flags)
+struct rproc* lookup_slot_by_flags(int flags)
 {
-    struct rproc *rp;
-    
-    for (rp = rproc; rp < &rproc[NR_SYS_PROCS]; rp++) {
+    if (flags == 0) {
+        return NULL;
+    }
+
+    for (int slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
+        struct rproc *rp = &rproc[slot_nr];
         if ((rp->r_flags & RS_IN_USE) && (rp->r_flags & flags)) {
             return rp;
         }
     }
-    
+
     return NULL;
 }
 
@@ -2143,12 +2339,18 @@ struct rproc* lookup_slot_by_flags(const int flags)
  *===========================================================================*/
 int alloc_slot(struct rproc **rpp)
 {
-    for (struct rproc *rp = rproc; rp < &rproc[NR_SYS_PROCS]; rp++) {
-        if (!(rp->r_flags & RS_IN_USE)) {
-            *rpp = rp;
+    if (rpp == NULL) {
+        return EINVAL;
+    }
+
+    for (int slot_nr = 0; slot_nr < NR_SYS_PROCS; slot_nr++) {
+        struct rproc *current_slot = &rproc[slot_nr];
+        if ((current_slot->r_flags & RS_IN_USE) == 0) {
+            *rpp = current_slot;
             return OK;
         }
     }
+
     return ENOMEM;
 }
 
@@ -2157,11 +2359,16 @@ int alloc_slot(struct rproc **rpp)
  *===========================================================================*/
 void free_slot(struct rproc *rp)
 {
-    if (rp == NULL || rp->r_pub == NULL) {
+    struct rprocpub *rpub;
+
+    if (rp == NULL) {
         return;
     }
 
-    struct rprocpub *rpub = rp->r_pub;
+    rpub = rp->r_pub;
+    if (rpub == NULL) {
+        return;
+    }
 
     late_reply(rp, OK);
 
@@ -2172,92 +2379,127 @@ void free_slot(struct rproc *rp)
     rp->r_flags = 0;
     rp->r_pid = -1;
     rpub->in_use = FALSE;
-    rproc_ptr[_ENDPOINT_P(rpub->endpoint)] = NULL;
+    
+    int endpoint_index = _ENDPOINT_P(rpub->endpoint);
+    if (endpoint_index >= 0) {
+        rproc_ptr[endpoint_index] = NULL;
+    }
 }
 
 
 /*===========================================================================*
  *				get_next_name				     *
  *===========================================================================*/
-#include <ctype.h>
-#include <string.h>
-#include <stdio.h>
-#include <stddef.h>
-
-#define RS_MAX_LABEL_LEN 64 // An assumed value for compilation
-
-static char *get_next_name(const char *ptr, char *name, const char *caller_label)
+static char *get_next_name(char *ptr, char *name, char *caller_label)
 {
-	while (1)
-	{
-		while (isspace((unsigned char)*ptr))
-		{
-			ptr++;
-		}
+    if (ptr == NULL || name == NULL || caller_label == NULL) {
+        return NULL;
+    }
 
-		if (*ptr == '\0')
-		{
-			return NULL;
-		}
+    char *current = ptr;
+    char *word_end;
 
-		const char *name_start = ptr;
-		while (*ptr != '\0' && !isspace((unsigned char)*ptr))
-		{
-			ptr++;
-		}
+    while (*current != '\0') {
+        while (*current != '\0' && isspace((unsigned char)*current)) {
+            current++;
+        }
 
-		const size_t len = (size_t)(ptr - name_start);
+        if (*current == '\0') {
+            break;
+        }
 
-		if (len > RS_MAX_LABEL_LEN)
-		{
-			fprintf(stderr,
-				"rs:get_next_name: bad ipc list entry '%.*s' for %s: too long\n",
-				(int)len, name_start, caller_label);
-			continue;
-		}
+        word_end = current;
+        while (*word_end != '\0' && !isspace((unsigned char)*word_end)) {
+            word_end++;
+        }
 
-		memcpy(name, name_start, len);
-		name[len] = '\0';
-		return (char *)ptr;
-	}
+        size_t len = word_end - current;
+        if (len == 0) {
+            current = word_end;
+            continue;
+        }
+
+        if (len > RS_MAX_LABEL_LEN) {
+            printf("rs:get_next_name: bad ipc list entry '%.*s' for %s: too long\n",
+                   (int)len, current, caller_label);
+            current = word_end;
+            continue;
+        }
+
+        memcpy(name, current, len);
+        name[len] = '\0';
+        return word_end;
+    }
+
+    return NULL;
 }
 
 /*===========================================================================*
  *				add_forward_ipc				     *
  *===========================================================================*/
-void add_forward_ipc(struct rproc *rp, struct priv *privp)
+void add_forward_ipc(rp, privp)
+struct rproc *rp;
+struct priv *privp;
 {
-	char name[RS_MAX_LABEL_LEN + 1];
-	char *p = rp->r_ipc_list;
-	struct rprocpub *rpub = rp->r_pub;
+	char name[RS_MAX_LABEL_LEN+1], *p;
+	struct rprocpub *rpub;
+
+	rpub = rp->r_pub;
+	p = rp->r_ipc_list;
 
 	while ((p = get_next_name(p, name, rpub->label)) != NULL) {
-		if (strcmp(name, "SYSTEM") == 0 || strcmp(name, "USER") == 0) {
-			endpoint_t endpoint = (strcmp(name, "SYSTEM") == 0) ? SYSTEM : INIT_PROC_NR;
-			struct priv priv;
-			int r = sys_getpriv(&priv, endpoint);
+		process_ipc_name(name, privp);
+	}
+}
 
-			if (r < 0) {
-				printf("add_forward_ipc: unable to get priv_id for '%s': %d\n", name, r);
-			} else {
+static void process_ipc_name(const char *name, struct priv *privp)
+{
+	if (strcmp(name, "SYSTEM") == 0) {
+		set_endpoint_privilege(SYSTEM, privp);
+		return;
+	}
+	
+	if (strcmp(name, "USER") == 0) {
+		set_endpoint_privilege(INIT_PROC_NR, privp);
+		return;
+	}
+	
+	set_matching_process_privileges(name, privp);
+}
+
+static void set_endpoint_privilege(endpoint_t endpoint, struct priv *privp)
+{
+	struct priv priv;
+	int r;
+	
+	if ((r = sys_getpriv(&priv, endpoint)) < 0) {
+		printf("add_forward_ipc: unable to get priv_id for endpoint %d: %d\n",
+			endpoint, r);
+		return;
+	}
+	
 #if PRIV_DEBUG
-				printf("  RS: add_forward_ipc: setting sendto bit for %d...\n", endpoint);
+	printf("  RS: add_forward_ipc: setting sendto bit for %d...\n", endpoint);
 #endif
-				set_sys_bit(privp->s_ipc_to, priv.s_id);
-			}
-		} else {
-			struct rproc *rrp;
-			for (rrp = BEG_RPROC_ADDR; rrp < END_RPROC_ADDR; rrp++) {
-				if ((rrp->r_flags & RS_IN_USE) &&
-					(strcmp(rrp->r_pub->proc_name, name) == 0)) {
+	
+	set_sys_bit(privp->s_ipc_to, priv.s_id);
+}
+
+static void set_matching_process_privileges(const char *name, struct priv *privp)
+{
+	struct rproc *rrp;
+	
+	for (rrp = BEG_RPROC_ADDR; rrp < END_RPROC_ADDR; rrp++) {
+		if (!(rrp->r_flags & RS_IN_USE)) {
+			continue;
+		}
+		
+		if (strcmp(rrp->r_pub->proc_name, name) == 0) {
 #if PRIV_DEBUG
-					printf("  RS: add_forward_ipc: setting"
-						" sendto bit for %d...\n",
-						rrp->r_pub->endpoint);
+			printf("  RS: add_forward_ipc: setting sendto bit for %d...\n",
+				rrp->r_pub->endpoint);
 #endif
-					set_sys_bit(privp->s_ipc_to, rrp->r_priv.s_id);
-				}
-			}
+			set_sys_bit(privp->s_ipc_to, rrp->r_priv.s_id);
 		}
 	}
 }
@@ -2266,40 +2508,75 @@ void add_forward_ipc(struct rproc *rp, struct priv *privp)
 /*===========================================================================*
  *				add_backward_ipc			     *
  *===========================================================================*/
-void add_backward_ipc(struct rproc *rp, struct priv *privp)
+void add_backward_ipc(rp, privp)
+struct rproc *rp;
+struct priv *privp;
 {
-	const char *proc_name = rp->r_pub->proc_name;
-	const int is_sys_proc = (privp->s_flags & SYS_PROC);
+	struct rproc *rrp;
+	char *proc_name;
 
-	for (struct rproc *rrp = BEG_RPROC_ADDR; rrp < END_RPROC_ADDR; rrp++) {
-		if (!(rrp->r_flags & RS_IN_USE) || !rrp->r_ipc_list[0]) {
+	if (!rp || !privp || !rp->r_pub) {
+		return;
+	}
+
+	proc_name = rp->r_pub->proc_name;
+	if (!proc_name) {
+		return;
+	}
+
+	for (rrp = BEG_RPROC_ADDR; rrp < END_RPROC_ADDR; rrp++) {
+		if (!(rrp->r_flags & RS_IN_USE)) {
 			continue;
 		}
 
-		int grant_permission = 0;
-		const struct rprocpub *rrpub = rrp->r_pub;
-
-		if (strcmp(rrp->r_ipc_list, RSS_IPC_ALL) == 0) {
-			grant_permission = 1;
-		} else if (strcmp(rrp->r_ipc_list, RSS_IPC_ALL_SYS) == 0 && is_sys_proc) {
-			grant_permission = 1;
-		} else {
-			char name[RS_MAX_LABEL_LEN + 1];
-			const char *p = rrp->r_ipc_list;
-			while ((p = get_next_name(p, name, rrpub->label)) != NULL) {
-				if (strcmp(proc_name, name) == 0) {
-					grant_permission = 1;
-					break;
-				}
-			}
+		if (!rrp->r_ipc_list[0]) {
+			continue;
 		}
 
-		if (grant_permission) {
+		process_ipc_entry(rrp, privp, proc_name);
+	}
+}
+
+static void process_ipc_entry(struct rproc *rrp, struct priv *privp, char *proc_name)
+{
+	struct rprocpub *rrpub;
+	int is_ipc_all;
+	int is_ipc_all_sys;
+
+	if (!rrp->r_pub) {
+		return;
+	}
+
+	rrpub = rrp->r_pub;
+
+	is_ipc_all = (strcmp(rrp->r_ipc_list, RSS_IPC_ALL) == 0);
+	is_ipc_all_sys = (strcmp(rrp->r_ipc_list, RSS_IPC_ALL_SYS) == 0);
+
+	if (is_ipc_all || (is_ipc_all_sys && (privp->s_flags & SYS_PROC))) {
+		grant_ipc_permission(privp, &rrp->r_priv, rrpub);
+		return;
+	}
+
+	check_ipc_target_list(rrp, privp, proc_name, rrpub);
+}
+
+static void grant_ipc_permission(struct priv *privp, struct priv *source_priv, struct rprocpub *rrpub)
+{
 #if PRIV_DEBUG
-			printf("  RS: add_backward_ipc: setting sendto bit for %d...\n",
-				rrpub->endpoint);
+	printf("  RS: add_backward_ipc: setting sendto bit for %d...\n", rrpub->endpoint);
 #endif
-			set_sys_bit(privp->s_ipc_to, rrp->r_priv.s_id);
+	set_sys_bit(privp->s_ipc_to, source_priv->s_id);
+}
+
+static void check_ipc_target_list(struct rproc *rrp, struct priv *privp, char *proc_name, struct rprocpub *rrpub)
+{
+	char name[RS_MAX_LABEL_LEN + 1];
+	char *p;
+
+	p = rrp->r_ipc_list;
+	while ((p = get_next_name(p, name, rrpub->label)) != NULL) {
+		if (strcmp(proc_name, name) == 0) {
+			grant_ipc_permission(privp, &rrp->r_priv, rrpub);
 		}
 	}
 }
@@ -2310,36 +2587,30 @@ void add_backward_ipc(struct rproc *rp, struct priv *privp)
  *===========================================================================*/
 void init_privs(struct rproc *rp, struct priv *privp)
 {
-	if (!rp || !privp || !rp->r_ipc_list)
-	{
+	int i;
+	int is_ipc_all;
+	int is_ipc_all_sys;
+
+	if (rp == NULL || privp == NULL) {
 		return;
 	}
 
-	fill_send_mask(&privp->s_ipc_to, 0);
+	fill_send_mask(&privp->s_ipc_to, FALSE);
+
+	is_ipc_all = (strcmp(rp->r_ipc_list, RSS_IPC_ALL) == 0);
+	is_ipc_all_sys = (strcmp(rp->r_ipc_list, RSS_IPC_ALL_SYS) == 0);
 
 #if PRIV_DEBUG
 	printf("  RS: init_privs: ipc list is '%s'...\n", rp->r_ipc_list);
 #endif
 
-	if (strcmp(rp->r_ipc_list, RSS_IPC_ALL) == 0)
-	{
-		for (int i = 0; i < NR_SYS_PROCS; i++)
-		{
-			set_sys_bit(privp->s_ipc_to, i);
-		}
-	}
-	else if (strcmp(rp->r_ipc_list, RSS_IPC_ALL_SYS) == 0)
-	{
-		for (int i = 0; i < NR_SYS_PROCS; i++)
-		{
-			if (i != USER_PRIV_ID)
-			{
+	if (is_ipc_all || is_ipc_all_sys) {
+		for (i = 0; i < NR_SYS_PROCS; i++) {
+			if (is_ipc_all || i != USER_PRIV_ID) {
 				set_sys_bit(privp->s_ipc_to, i);
 			}
 		}
-	}
-	else
-	{
+	} else {
 		add_forward_ipc(rp, privp);
 		add_backward_ipc(rp, privp);
 	}
